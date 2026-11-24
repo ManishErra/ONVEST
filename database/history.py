@@ -7,32 +7,116 @@ Default DB location: %LOCALAPPDATA%/ONVEST/onvest.db with fallbacks.
 
 import os
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-def get_default_db_path() -> Path:
+def get_candidate_db_paths() -> List[Path]:
     """
-    Returns the default path to the ONVEST SQLite database file.
-    Uses %LOCALAPPDATA%/ONVEST/onvest.db if available,
-    otherwise falls back to ~/.onvest/onvest.db or a local ./data directory.
+    Returns the ordered default candidate database paths:
+    1. %LOCALAPPDATA%/ONVEST/onvest.db (standard Windows per-user local app data)
+    2. ~/.onvest/onvest.db (user home profile fallback)
+    3. <project_root>/data/onvest.db (workspace local portable directory fallback)
     """
+    candidates = []
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        base_dir = Path(local_app_data) / "ONVEST"
-    else:
-        user_home = Path.home()
-        base_dir = user_home / ".onvest"
+        candidates.append(Path(local_app_data) / "ONVEST" / "onvest.db")
+    candidates.append(Path.home() / ".onvest" / "onvest.db")
+    candidates.append(Path(__file__).resolve().parent.parent / "data" / "onvest.db")
+    return candidates
 
-    try:
-        base_dir.mkdir(parents=True, exist_ok=True)
-        return base_dir / "onvest.db"
-    except Exception:
-        # Fallback to local application data directory
-        fallback_dir = Path("./data")
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        return fallback_dir / "onvest.db"
+
+def get_default_db_path(candidates: Optional[List[Path]] = None) -> Path:
+    """
+    Returns the default path to the ONVEST SQLite database file by verifying actual write access.
+
+    Two-tier verification:
+    - If onvest.db exists: Opens connection, runs integrity check (PRAGMA quick_check),
+      and verifies write permissions within a transaction that is rolled back (creating
+      and rolling back a uniquely named table), leaving existing user tables and records
+      completely untouched. Never deletes pre-existing files.
+    - If onvest.db does not exist: Probes candidate directory using a uniquely named temporary
+      SQLite file (.probe_write_<uuid>.tmp). The probe file and any sidecars (-journal, -wal, -shm)
+      must be closed and unlinked cleanly. If cleanup fails (e.g. file cannot be removed),
+      the candidate is rejected and a useful diagnostic is retained.
+      Never deletes anything except the uniquely named probe file created by this invocation.
+
+    If an existing database is read-only, corrupt, or unusable, or if a candidate directory
+    is unwritable, or if probe file cleanup fails, continues to the next candidate.
+    If all candidates fail, raises PermissionError detailing diagnostics rather than silently using an unwritable path.
+    """
+    candidate_list = list(candidates) if candidates is not None else get_candidate_db_paths()
+    diagnostics = []
+
+    for db_file in candidate_list:
+        candidate_dir = db_file.parent
+        try:
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+
+            if db_file.exists():
+                probe_tbl = f"_probe_tx_{uuid.uuid4().hex}"
+                conn = sqlite3.connect(str(db_file), timeout=5.0)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("PRAGMA quick_check")
+                    status = cur.fetchone()
+                    if not status or status[0] != "ok":
+                        raise sqlite3.DatabaseError(f"Database integrity failure: {status}")
+
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(f"CREATE TABLE {probe_tbl} (id INTEGER PRIMARY KEY)")
+                    conn.execute(f"INSERT INTO {probe_tbl} DEFAULT VALUES")
+                    conn.rollback()
+                    return db_file
+                finally:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    conn.close()
+            else:
+                probe_name = f".probe_write_{uuid.uuid4().hex}.tmp"
+                probe_file = candidate_dir / probe_name
+                probe_success = False
+                cleanup_errors = []
+                try:
+                    conn = sqlite3.connect(str(probe_file), timeout=5.0)
+                    try:
+                        conn.execute("CREATE TABLE _p (id INTEGER PRIMARY KEY)")
+                        conn.execute("INSERT INTO _p DEFAULT VALUES")
+                        conn.commit()
+                        probe_success = True
+                    finally:
+                        conn.close()
+                except Exception as pe:
+                    cleanup_errors.append(f"Probe creation failed: {pe}")
+                finally:
+                    # Never delete anything except the uniquely named probe file created by this invocation
+                    for ext in ("", "-journal", "-wal", "-shm"):
+                        sidecar = candidate_dir / f"{probe_name}{ext}"
+                        try:
+                            if sidecar.exists():
+                                sidecar.unlink()
+                        except Exception as ue:
+                            cleanup_errors.append(f"Failed to remove probe sidecar {sidecar.name}: {ue}")
+
+                if probe_success and not cleanup_errors:
+                    return db_file
+                else:
+                    reason = "; ".join(cleanup_errors) if cleanup_errors else "Probe creation failed"
+                    diagnostics.append(f"{db_file}: {reason}")
+        except Exception as exc:
+            diagnostics.append(f"{db_file}: {exc}")
+            continue
+
+    diag_summary = "; ".join(diagnostics) if diagnostics else "All candidates failed write check"
+    raise PermissionError(
+        f"Unable to find a writable location for ONVEST SQLite database. "
+        f"Tested candidates failed write verification: {diag_summary}."
+    )
 
 
 _CURRENT_DB_PATH: Optional[Path] = None
@@ -93,24 +177,17 @@ def init_db(db_path: Optional[Path] = None) -> None:
                 ON calculation_history(created_at DESC)
                 """
             )
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
 
 
 def save_calculation(calc_data: Dict[str, Any], db_path: Optional[Path] = None) -> int:
     """
-    Saves a calculation record to the database.
-    Expects keys:
-        - calc_type: 'EMI' or 'SIP'
-        - principal_or_monthly: float
-        - annual_rate: float
-        - duration_months: int
-        - monthly_amount: float
-        - total_interest_or_returns: float
-        - total_amount: float
-        - created_at: optional ISO timestamp string
-
-    Returns the new record's ID.
+    Saves a calculation record to the database with transaction protection.
+    Rolls back on error.
     """
     calc_type = calc_data.get("calc_type")
     if calc_type not in ("EMI", "SIP"):
@@ -148,6 +225,9 @@ def save_calculation(calc_data: Dict[str, Any], db_path: Optional[Path] = None) 
                 ),
             )
             return cursor.lastrowid
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
 
@@ -176,7 +256,9 @@ def get_all_calculations(db_path: Optional[Path] = None, limit: int = 100) -> Li
             """,
             (limit,),
         )
-        return [dict(row) for row in cursor.fetchall()]
+        rows = [dict(row) for row in cursor.fetchall()]
+        cursor.close()
+        return rows
     finally:
         conn.close()
 
@@ -220,7 +302,11 @@ def get_latest_calculation(db_path: Optional[Path] = None) -> Optional[Dict[str,
 
 
 def delete_calculation(calc_id: int, db_path: Optional[Path] = None) -> bool:
-    """Deletes an individual calculation record by ID. Returns True if deleted."""
+    """
+    Deletes an individual calculation record by ID.
+    Rolls back transaction on error.
+    Returns True if a row was actually deleted, False if record was not found.
+    """
     conn = get_connection(db_path)
     try:
         with conn:
@@ -229,21 +315,26 @@ def delete_calculation(calc_id: int, db_path: Optional[Path] = None) -> bool:
                 (calc_id,),
             )
             return cursor.rowcount > 0
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
 
 
 def clear_all_calculations(db_path: Optional[Path] = None) -> bool:
-    """Clears all records from the calculation history. Returns True on success."""
+    """
+    Clears all records from calculation_history.
+    Preserves transaction rollback on failure.
+    Propagates database errors and never reports success on failure.
+    """
     conn = get_connection(db_path)
     try:
         with conn:
             conn.execute("DELETE FROM calculation_history")
-            # Vacuum or reset sequence
-            conn.execute("DELETE FROM sqlite_sequence WHERE name='calculation_history'")
             return True
-    except sqlite3.OperationalError:
-        # sqlite_sequence might not exist if autoincrement hasn't fired yet
-        return True
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()

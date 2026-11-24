@@ -212,7 +212,7 @@ class EMIPage(ctk.CTkScrollableFrame):
             self.results_container,
             title="Monthly Equated Installment (EMI)",
             initial_value="₹0.00",
-            caption="Calculated based on reducing balance method",
+            caption="Calculated based on reducing-balance method (rounded to 2 decimal places)",
             highlight_color=PRIMARY_BLUE,
             is_primary=True,
         )
@@ -260,6 +260,42 @@ class EMIPage(ctk.CTkScrollableFrame):
         )
         self.breakdown_bar.pack(fill="x")
 
+        # Explanatory Disclaimer Card
+        disclaimer_card = ctk.CTkFrame(
+            self.results_container,
+            fg_color=BG_CARD,
+            corner_radius=10,
+            border_width=1,
+            border_color=BORDER_COLOR,
+        )
+        disclaimer_card.pack(fill="x", pady=(12, 0))
+
+        d_inner = ctk.CTkFrame(disclaimer_card, fg_color="transparent")
+        d_inner.pack(fill="x", padx=16, pady=12)
+
+        ctk.CTkLabel(
+            d_inner,
+            text="IMPORTANT FINANCIAL DISCLAIMER",
+            font=FONT_BADGE,
+            text_color="#F59E0B",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+
+        disclaimer_text = (
+            "This is an estimated reducing-balance EMI calculation. The displayed final installment "
+            "adjusts for rounding differences. Actual lender repayment schedules may differ due to "
+            "payment dates, daily interest calculations, fees, and lender-specific rounding policies."
+        )
+        ctk.CTkLabel(
+            d_inner,
+            text=disclaimer_text,
+            font=FONT_BODY_SMALL,
+            text_color=TEXT_MUTED,
+            wraplength=480,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x")
+
     def _show_error(self, message: str):
         """Displays error message and resets confirmation."""
         self.feedback_label.configure(text=f"⚠ {message}", text_color=ERROR_RED)
@@ -272,8 +308,8 @@ class EMIPage(ctk.CTkScrollableFrame):
         """Clears feedback label."""
         self.feedback_label.configure(text="")
 
-    def _handle_calculate(self):
-        """Validates inputs and computes EMI."""
+    def _handle_calculate(self) -> bool:
+        """Validates current inputs, computes EMI, and updates the display. Returns True if successful."""
         self._clear_feedback()
         p_str = self.principal_entry.get()
         r_str = self.rate_entry.get()
@@ -284,10 +320,30 @@ class EMIPage(ctk.CTkScrollableFrame):
             res = calculate_emi(p, r, t)
             self.last_result = res
 
+            # Format captions based on whether final installment was adjusted
+            if res.tenure_months > 1 and round(abs(res.final_installment - res.monthly_emi), 2) > 0:
+                emi_caption = (
+                    f"First {res.tenure_months - 1} payments: {format_inr(res.monthly_emi)} • "
+                    f"Final payment: {format_inr(res.final_installment)}\n"
+                    f"Final installment differs slightly because monthly EMI is rounded to two decimal places."
+                )
+                total_caption = (
+                    f"({res.tenure_months - 1} × {format_inr(res.monthly_emi)}) + {format_inr(res.final_installment)} = {format_inr(res.total_repayment)} "
+                    f"(Principal {format_inr(res.principal)} + Interest {format_inr(res.total_interest)})"
+                )
+            else:
+                emi_caption = (
+                    f"Payable monthly for {res.tenure_months} installment{'s' if res.tenure_months != 1 else ''} ({res.tenure_years} yrs)\n"
+                    f"Monthly EMI rounded to two decimal places (no final-installment adjustment needed)."
+                    if res.tenure_months > 1 else
+                    f"Single lump-sum payment for {res.tenure_months} month ({res.tenure_years} yrs)"
+                )
+                total_caption = f"Principal {format_inr(res.principal)} + Interest {format_inr(res.total_interest)}"
+
             # Update Metric Display
             self.emi_card.update_value(
                 format_inr(res.monthly_emi),
-                f"Payable monthly for {res.tenure_months} installments ({res.tenure_years} yrs)",
+                emi_caption,
             )
             self.principal_card.update_value(
                 format_inr(res.principal),
@@ -299,7 +355,7 @@ class EMIPage(ctk.CTkScrollableFrame):
             )
             self.total_card.update_value(
                 format_inr(res.total_repayment),
-                f"Principal {format_inr(res.principal)} + Interest {format_inr(res.total_interest)}",
+                total_caption,
             )
 
             # Update Visual Breakdown Bar
@@ -309,13 +365,16 @@ class EMIPage(ctk.CTkScrollableFrame):
                 left_amount=res.principal,
                 right_amount=res.total_interest,
             )
+            return True
 
         except ValueError as e:
             self.last_result = None
             self._show_error(str(e))
+            return False
         except Exception as e:
             self.last_result = None
             self._show_error(f"Unexpected calculation error: {e}")
+            return False
 
     def _handle_reset(self):
         """Resets all input fields and calculation results."""
@@ -325,20 +384,22 @@ class EMIPage(ctk.CTkScrollableFrame):
         self.last_result = None
         self._clear_feedback()
 
-        self.emi_card.update_value("₹0.00", "Calculated based on reducing balance method")
+        self.emi_card.update_value("₹0.00", "Calculated based on reducing-balance method (rounded to 2 decimal places)")
         self.principal_card.update_value("₹0.00", "Base borrowed capital")
         self.interest_card.update_value("₹0.00", "Cumulative cost of borrowing")
         self.total_card.update_value("₹0.00", "Total outflow over the entire tenure")
         self.breakdown_bar.update_ratios(0.5, 0.5, 0, 0)
 
     def _handle_save(self):
-        """Saves current calculation to SQLite database."""
-        if self.last_result is None:
-            # Try computing first
-            self._handle_calculate()
-            if self.last_result is None:
-                self._show_error("Please enter valid loan details and calculate before saving.")
-                return
+        """
+        Validates and recalculates using CURRENT input field values before saving.
+        Never saves stale or invalid calculations.
+        """
+        # Always recalculate from current input fields first
+        is_valid = self._handle_calculate()
+        if not is_valid or self.last_result is None:
+            # _handle_calculate already displayed the specific validation error
+            return
 
         res = self.last_result
         calc_record = {

@@ -50,7 +50,7 @@ class SIPPage(ctk.CTkScrollableFrame):
         header = SectionHeader(
             self,
             title="SIP Calculator",
-            subtitle="Project potential compound wealth creation through Systematic Investment Plans in mutual funds.",
+            subtitle="Project estimated compound wealth creation through Systematic Investment Plans in mutual funds (estimates, not guaranteed).",
         )
         header.pack(fill="x", padx=24, pady=(20, 10))
 
@@ -237,7 +237,7 @@ class SIPPage(ctk.CTkScrollableFrame):
             sub_grid,
             title="ESTIMATED RETURNS",
             initial_value="₹0.00",
-            caption="Capital appreciation from compounding",
+            caption="Projected capital appreciation (estimates, not guaranteed)",
             highlight_color=EMERALD_GREEN,
         )
         self.returns_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -275,8 +275,10 @@ class SIPPage(ctk.CTkScrollableFrame):
 
         disclaimer_text = (
             "SIP projections are illustrative estimates and actual mutual fund returns are "
-            "market-dependent and not guaranteed. Future value calculations exclude taxes, exit loads, "
-            "and expense ratios. Past market performance is not indicative of future returns."
+            "market-dependent and not guaranteed. Projected returns are based on assumed constant "
+            "compounding rates for illustration purposes and must not be regarded as guaranteed or assured "
+            "returns. Future value calculations exclude taxes, exit loads, and expense ratios. Past "
+            "market performance is not indicative of future returns."
         )
         ctk.CTkLabel(
             d_inner,
@@ -300,8 +302,8 @@ class SIPPage(ctk.CTkScrollableFrame):
         """Clears feedback label."""
         self.feedback_label.configure(text="")
 
-    def _handle_calculate(self):
-        """Validates inputs and computes SIP projections."""
+    def _handle_calculate(self) -> bool:
+        """Validates current inputs, computes SIP projections, and updates the display. Returns True if successful."""
         self._clear_feedback()
         m_str = self.monthly_entry.get()
         r_str = self.rate_entry.get()
@@ -315,15 +317,15 @@ class SIPPage(ctk.CTkScrollableFrame):
             # Update Metric Display
             self.fv_card.update_value(
                 format_inr(res.future_value),
-                f"Projected maturity value after {res.duration_years} years ({res.duration_months} monthly installments)",
+                f"Estimated maturity projection after {res.duration_years} years ({res.duration_months} monthly installments) — not guaranteed",
             )
             self.invested_card.update_value(
                 format_inr(res.total_invested),
-                f"{res.invested_ratio * 100:.1f}% of final projected value",
+                f"{res.invested_ratio * 100:.1f}% of final estimated value",
             )
             self.returns_card.update_value(
                 format_inr(res.estimated_returns),
-                f"{res.returns_ratio * 100:.1f}% estimated capital growth",
+                f"{res.returns_ratio * 100:.1f}% estimated capital growth (estimate, not guaranteed)",
             )
 
             # Update Visual Breakdown Bar
@@ -333,13 +335,16 @@ class SIPPage(ctk.CTkScrollableFrame):
                 left_amount=res.total_invested,
                 right_amount=res.estimated_returns,
             )
+            return True
 
         except ValueError as e:
             self.last_result = None
             self._show_error(str(e))
+            return False
         except Exception as e:
             self.last_result = None
             self._show_error(f"Unexpected calculation error: {e}")
+            return False
 
     def _handle_reset(self):
         """Resets all input fields and calculation results."""
@@ -355,12 +360,14 @@ class SIPPage(ctk.CTkScrollableFrame):
         self.breakdown_bar.update_ratios(0.5, 0.5, 0, 0)
 
     def _handle_save(self):
-        """Saves current calculation to SQLite database."""
-        if self.last_result is None:
-            self._handle_calculate()
-            if self.last_result is None:
-                self._show_error("Please enter valid investment details and calculate before saving.")
-                return
+        """
+        Validates and recalculates using CURRENT input field values before saving.
+        Never saves stale or invalid calculations.
+        """
+        is_valid = self._handle_calculate()
+        if not is_valid or self.last_result is None:
+            # _handle_calculate already displayed the specific validation error
+            return
 
         res = self.last_result
         calc_record = {

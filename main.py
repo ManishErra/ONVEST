@@ -219,13 +219,20 @@ class OnvestApp(ctk.CTk):
             page.grid(row=0, column=0, sticky="nsew")
 
     def navigate_to(self, page_key: str):
-        """Switches active view and updates sidebar highlighting."""
+        """Switches active view, raises the selected frame, and updates sidebar highlighting."""
         if page_key not in self.pages:
             return
 
-        # Bring requested page to top
-        page = self.pages[page_key]
-        page.tkraise()
+        # Bring requested page to top and ensure it is mapped and raised
+        for key, p in self.pages.items():
+            target_widget = getattr(p, "_parent_frame", p)
+            if key == page_key:
+                target_widget.grid(row=0, column=0, sticky="nsew")
+                target_widget.tkraise()
+                p.tkraise()
+            else:
+                target_widget.grid_remove()
+
         self.current_view_key = page_key
 
         # Update sidebar button states
